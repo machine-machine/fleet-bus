@@ -4,11 +4,11 @@ Context Engineer — Fleet Context Pre-loader
 Bundles relevant context for a task before an agent claims it.
 
 Flow:
-  1. Embed task payload via BGE-M3 (memory-embeddings:8000)
-  2. Semantic search Qdrant (agent_memory) → top-10 relevant memories
-  3. Fetch recent SpacetimeDB events + completed tasks
-  4. Distill with Gemini Flash 3 → compact 2k-token bundle
-  5. Write context.json to /tmp/context-{task_id}.json (+ Minio if configured)
+  1. m2-memory semantic search (MemoryClient — agent_id filter + importance + ColBERT rerank)
+     Falls back to direct Qdrant if skill unavailable.
+  2. Fetch recent SpacetimeDB events + completed tasks
+  3. Distill with Gemini Flash distillation → compact 2k-token bundle
+  4. Write context.json to /tmp/context-{task_id}.json (+ Minio if configured)
 
 Usage:
   python3 context_engineer.py <task_id> <task_type> <payload>
@@ -23,9 +23,10 @@ import urllib.request
 import urllib.error
 
 # ── Config ────────────────────────────────────────────────────────────────────
-EMBEDDINGS_URL   = os.getenv("EMBEDDINGS_URL",   "http://memory-embeddings:8000")
-QDRANT_URL       = os.getenv("QDRANT_URL",        "http://memory-qdrant:6333")
-QDRANT_COLL      = os.getenv("QDRANT_COLLECTION", "agent_memory")
+EMBEDDINGS_URL   = os.getenv("EMBEDDINGS_URL",   "http://memory-embeddings:8000")  # fallback only
+QDRANT_URL       = os.getenv("QDRANT_URL",        "http://memory-qdrant:6333")       # fallback only
+QDRANT_COLL      = os.getenv("QDRANT_COLLECTION", "agent_memory")                    # fallback only
+# Primary: m2-memory MemoryClient (see _M2_MEMORY_AVAILABLE below)
 STDB_URI         = os.getenv("SPACETIMEDB_URI",   "http://spacetimedb:3000")
 STDB_TOKEN       = os.getenv("SPACETIMEDB_TOKEN", "")
 GEMINI_KEY       = os.getenv("GEMINI_API_KEY",    "")
@@ -52,23 +53,75 @@ def _get(url: str, headers: dict = None, timeout: int = 8) -> dict:
     return json.loads(resp.read())
 
 
-# ── Step 1: Embed ─────────────────────────────────────────────────────────────
+# ── Step 1: m2-memory search (primary) ───────────────────────────────────────
 
-def embed(text: str) -> list:
-    """Get BGE-M3 embedding for text."""
-    result = _post(f"{EMBEDDINGS_URL}/embed", {"inputs": text})
-    if isinstance(result, list) and result:
-        vec = result[0] if isinstance(result[0], list) else result
-        return vec
-    raise RuntimeError(f"Unexpected embedding response: {str(result)[:100]}")
+# Locate m2-memory skill — try skill path, then env override
+_M2_MEMORY_SCRIPT_DIR = os.getenv(
+    "M2_MEMORY_SCRIPT_DIR",
+    os.path.expanduser("~/.openclaw/skills/m2-memory/scripts")
+)
+if _M2_MEMORY_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _M2_MEMORY_SCRIPT_DIR)
 
+try:
+    import asyncio
+    import importlib
+    _mc_mod = importlib.import_module("memory_client")
+    MemoryClient = _mc_mod.MemoryClient
+    _M2_MEMORY_AVAILABLE = True
+except Exception as _mc_err:
+    _M2_MEMORY_AVAILABLE = False
+    _mc_err_msg = str(_mc_err)
 
-# ── Step 2: Qdrant semantic search ────────────────────────────────────────────
 
 def search_memories(query: str, top_k: int = TOP_K_MEMORIES) -> list:
-    """Search Qdrant agent_memory for semantically relevant memories."""
+    """
+    Search m2 agent memory for semantically relevant memories.
+    Primary: m2-memory MemoryClient (agent_id filter, importance scoring, ColBERT rerank).
+    Fallback: direct Qdrant BGE-M3 search.
+    """
+    if _M2_MEMORY_AVAILABLE:
+        return _search_via_m2_memory(query, top_k)
+    return _search_via_qdrant_direct(query, top_k)
+
+
+def _search_via_m2_memory(query: str, top_k: int) -> list:
+    """Use m2-memory MemoryClient — proper agent_id filtering + importance scoring."""
     try:
-        vector = embed(query)
+        async def _run():
+            async with MemoryClient() as client:
+                return await client.search(query, limit=top_k, min_importance=0.0)
+
+        results = asyncio.run(_run())
+        memories = []
+        for r in results:
+            memories.append({
+                "score":      round(r.get("score", 0), 3),
+                "text":       r.get("content", r.get("text", ""))[:300],
+                "type":       r.get("memory_type", ""),
+                "importance": r.get("importance", 0.5),
+                "entities":   r.get("entities", []),
+                "ts":         r.get("timestamp", ""),
+                "_source":    "m2-memory",
+            })
+        return memories
+    except Exception as e:
+        # m2-memory call failed — fall back to direct Qdrant
+        fallback = _search_via_qdrant_direct(query, top_k)
+        if fallback:
+            fallback[0]["_fallback_reason"] = str(e)[:80]
+        return fallback
+
+
+def _search_via_qdrant_direct(query: str, top_k: int) -> list:
+    """Direct Qdrant fallback — raw BGE-M3 embed + vector search."""
+    try:
+        vec_resp = _post(f"{EMBEDDINGS_URL}/embed", {"inputs": query})
+        if isinstance(vec_resp, list) and vec_resp:
+            vector = vec_resp[0] if isinstance(vec_resp[0], list) else vec_resp
+        else:
+            raise RuntimeError(f"Bad embed response: {str(vec_resp)[:60]}")
+
         result = _post(
             f"{QDRANT_URL}/collections/{QDRANT_COLL}/points/search",
             {
@@ -78,19 +131,20 @@ def search_memories(query: str, top_k: int = TOP_K_MEMORIES) -> list:
                 "score_threshold": 0.35,
             }
         )
-        hits = result.get("result", [])
         memories = []
-        for h in hits:
-            payload = h.get("payload", {})
+        for h in result.get("result", []):
+            p = h.get("payload", {})
             memories.append({
-                "score": round(h.get("score", 0), 3),
-                "text": payload.get("text", payload.get("content", ""))[:300],
-                "tags": payload.get("tags", payload.get("entities", [])),
-                "ts": payload.get("timestamp", ""),
+                "score":    round(h.get("score", 0), 3),
+                "text":     p.get("content", p.get("text", ""))[:300],
+                "type":     p.get("memory_type", ""),
+                "entities": p.get("entities", []),
+                "ts":       p.get("timestamp", ""),
+                "_source":  "qdrant-direct",
             })
         return memories
     except Exception as e:
-        return [{"error": str(e), "text": "", "score": 0}]
+        return [{"error": str(e), "text": "", "score": 0, "_source": "qdrant-direct"}]
 
 
 # ── Step 3: SpacetimeDB recent context ────────────────────────────────────────
@@ -305,11 +359,15 @@ def run(task_id: str, task_type: str, payload: str) -> dict:
     bundle = distill(payload, task_type, memories, stdb)
 
     # 4. Add metadata
+    valid_memories = [m for m in memories if not m.get("error")]
+    memory_source = valid_memories[0].get("_source", "unknown") if valid_memories else "none"
+
     bundle["task_id"] = task_id
     bundle["task_type"] = task_type
     bundle["generated_at"] = int(t0)
     bundle["ttl_at"] = int(t0) + 3600
-    bundle["memories_searched"] = len([m for m in memories if not m.get("error")])
+    bundle["memories_searched"] = len(valid_memories)
+    bundle["memory_source"] = memory_source  # "m2-memory" | "qdrant-direct" | "none"
     bundle["generation_ms"] = int((time.time() - t0) * 1000)
 
     # 5. Write
@@ -340,8 +398,10 @@ if __name__ == "__main__":
         "task_id": result["task_id"],
         "summary": result.get("summary", ""),
         "memories_searched": result.get("memories_searched", 0),
+        "memory_source": result.get("memory_source", "?"),
         "generation_ms": result.get("generation_ms", 0),
         "distilled": result.get("_distilled", False),
+        "distill_model": result.get("_model", "none"),
         "path": result.get("_local_path", ""),
         "prior_decisions": len(result.get("prior_decisions", [])),
         "warnings": len(result.get("warnings", [])),
