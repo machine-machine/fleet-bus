@@ -26,23 +26,38 @@ warn() { echo -e "${YELLOW}⚠️  $*${RESET}" >&2; }
 err()  { echo -e "${RED}❌ $*${RESET}" >&2; }
 info() { echo -e "${CYAN}ℹ️  $*${RESET}"; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PURE_REDIS_PY="${SCRIPT_DIR}/pure_redis.py"
+
 redis_py() {
   python3 -c "
-import redis, sys, json, time, os
+import sys, json, time, os
 
-r = redis.Redis(host='$REDIS_HOST', port=$REDIS_PORT, decode_responses=True)
+# Try fast path (redis module), fall back to pure socket implementation
+try:
+    import redis as redis_lib
+    r = redis_lib.Redis(host='$REDIS_HOST', port=$REDIS_PORT, decode_responses=True)
+    USE_PURE = False
+except ImportError:
+    sys.path.insert(0, '${SCRIPT_DIR}')
+    import pure_redis
+    USE_PURE = True
+
 cmd = sys.argv[1]
 args = sys.argv[2:]
 
 if cmd == 'heartbeat':
     agent_id, preset, host, health = args[0], args[1], args[2], args[3]
     now = int(time.time())
+    if USE_PURE:
+        print(pure_redis.heartbeat('$REDIS_HOST', $REDIS_PORT, agent_id, preset, host, health, $HEARTBEAT_TTL))
+        sys.exit(0)
     pipe = r.pipeline()
-    pipe.hset(f'agent:{agent_id}', mapping={
+    pipe.hset('agent:{}'.format(agent_id), mapping={
         'id': agent_id, 'preset': preset, 'host': host,
         'lastSeen': now, 'health': health, 'status': 'alive'
     })
-    pipe.expire(f'agent:{agent_id}', $HEARTBEAT_TTL)
+    pipe.expire('agent:{}'.format(agent_id), $HEARTBEAT_TTL)
     pipe.sadd('agents', agent_id)
     pipe.xadd('events', {'agent': agent_id, 'type': 'heartbeat', 'ts': now}, maxlen=1000)
     pipe.execute()
@@ -150,6 +165,26 @@ print(json.dumps(h))
 " 2>/dev/null || echo '{}')
 
   redis_py heartbeat "$AGENT_ID" "$AGENT_PRESET" "$AGENT_HOST" "$h"
+
+  # SpacetimeDB dual-write (fire-and-forget)
+  if [ -n "${SPACETIMEDB_URI:-}" ] && [ -n "${SPACETIMEDB_TOKEN:-}" ]; then
+    python3 - << STDBEOF 2>/dev/null &
+import urllib.request, json, os
+uri = os.environ.get("SPACETIMEDB_URI","")
+tok = os.environ.get("SPACETIMEDB_TOKEN","")
+agent_id = os.environ.get("AGENT_ID","unknown")
+preset = os.environ.get("AGENT_PRESET","generalist")
+host = os.environ.get("AGENT_HOST", os.environ.get("HOSTNAME","?"))
+health = '${h}'
+body = json.dumps({"agentId": agent_id, "displayName": agent_id, "preset": preset, "host": host, "healthJson": health, "sessionKey": None}).encode()
+req = urllib.request.Request(f"{uri}/v1/database/fleet-bus/call/agent_heartbeat",
+    data=body, headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}, method="POST")
+try:
+    urllib.request.urlopen(req, timeout=3)
+except Exception:
+    pass
+STDBEOF
+  fi
 }
 
 cmd_status() {
