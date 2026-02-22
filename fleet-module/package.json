@@ -1,0 +1,11 @@
+{
+  "name": "fleet-module",
+  "version": "1.0.0",
+  "description": "M2O Fleet coordination module for SpacetimeDB",
+  "scripts": {
+    "build": "wasm-pack build --target web"
+  },
+  "dependencies": {
+    "@clockworklabs/spacetimedb-sdk": "^1.1.0"
+  }
+}
